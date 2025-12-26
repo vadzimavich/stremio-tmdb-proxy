@@ -1,4 +1,4 @@
-require('dotenv').config();
+// require('dotenv').config();
 const { addonBuilder } = require("stremio-addon-sdk");
 const axios = require("axios");
 
