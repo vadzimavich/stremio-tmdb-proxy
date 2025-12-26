@@ -6,12 +6,13 @@ const LANGUAGE = "ru-RU";
 
 const builder = new addonBuilder({
   id: "org.tmdbproxy.translator",
-  version: "1.0.6",
+  version: "1.0.7",
   name: "TMDB Translator (RU)",
   description: "Перевод описания и постеров на русский язык.",
   resources: ["meta"],
   types: ["movie", "series"],
-  idPrefixes: ["tt", "tmdb"]
+  idPrefixes: ["tt", "tmdb"],
+  catalogs: [] // <--- ВОТ ЭТА СТРОЧКА ОБЯЗАТЕЛЬНА, даже если пустая
 });
 
 // --- ХЕЛПЕРЫ ---
@@ -56,12 +57,12 @@ async function getTmdbId(type, id) {
       console.error("ID Convert Error:", e.message);
     }
   }
-  return id; // Возвращаем как есть, если не нашли
+  return id;
 }
 
 // --- ЛОГИКА АДДОНА ---
 builder.defineMetaHandler(async ({ type, id }) => {
-  console.log(`Processing Meta: ${type} / ${id}`); // ЛОГ
+  // console.log(`Processing Meta: ${type} / ${id}`); 
 
   const tmdbId = await getTmdbId(type, id);
   if (!tmdbId) return { meta: {} };
@@ -102,15 +103,11 @@ builder.defineMetaHandler(async ({ type, id }) => {
   }
 });
 
-// --- ROUTER VERCEL (FIXED) ---
+// --- ROUTER VERCEL ---
 const addonInterface = builder.getInterface();
 
 module.exports = async (req, res) => {
   try {
-    // Логируем входящий запрос для отладки
-    console.log(`Request: ${req.method} ${req.url}`);
-
-    // CORS заголовки (обязательно)
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', '*');
     res.setHeader('Content-Type', 'application/json');
@@ -121,10 +118,8 @@ module.exports = async (req, res) => {
       return;
     }
 
-    // Чистим URL
     const cleanUrl = req.url.split('?')[0];
 
-    // Главная
     if (cleanUrl === '/' || cleanUrl === '/configure') {
       res.statusCode = 302;
       res.setHeader('Location', '/manifest.json');
@@ -132,25 +127,20 @@ module.exports = async (req, res) => {
       return;
     }
 
-    // Манифест
     if (cleanUrl === '/manifest.json') {
       res.end(JSON.stringify(addonInterface.manifest));
       return;
     }
 
-    // Ловим запросы вида /meta/type/id.json
-    // Используем Regex, он надежнее для Vercel путей
     const match = cleanUrl.match(/\/([^/]+)\/([^/]+)\/([^/]+)\.json/);
 
     if (match) {
-      const resource = match[1]; // meta
-      const type = match[2];     // movie
-      const id = match[3];       // tt12345
+      const resource = match[1];
+      const type = match[2];
+      const id = match[3];
 
       if (addonInterface[resource]) {
         const result = await addonInterface[resource]({ type, id, extra: {} });
-
-        // Кеш на 4 часа
         res.setHeader('Cache-Control', 'max-age=14400, public');
         res.end(JSON.stringify(result));
       } else {
@@ -158,20 +148,16 @@ module.exports = async (req, res) => {
         res.end(JSON.stringify({ err: 'Resource not supported' }));
       }
     } else {
-      // Если путь не распознан
-      console.log(`Unknown path: ${cleanUrl}`);
       res.statusCode = 404;
       res.end(JSON.stringify({ err: 'Not found', path: cleanUrl }));
     }
 
   } catch (error) {
-    // Глобальный перехват ошибок
     console.error("CRITICAL ERROR:", error);
     res.statusCode = 500;
     res.end(JSON.stringify({
       err: 'Server Error',
-      details: error.message,
-      stack: error.stack
+      details: error.message
     }));
   }
 };
