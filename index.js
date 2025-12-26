@@ -6,18 +6,15 @@ const LANGUAGE = "ru-RU";
 
 const builder = new addonBuilder({
   id: "org.tmdbproxy.translator",
-  version: "1.0.5",
+  version: "1.0.6",
   name: "TMDB Translator (RU)",
-  description: "Переводит описание и постеры Cinemeta на русский язык (через TMDB Proxy).",
-  // Оставляем только meta (информация о фильме)
+  description: "Перевод описания и постеров на русский язык.",
   resources: ["meta"],
   types: ["movie", "series"],
-  // Перехватываем стандартные ID (tt...) и TMDB ID
   idPrefixes: ["tt", "tmdb"]
 });
 
 // --- ХЕЛПЕРЫ ---
-
 function proxyImage(path) {
   if (!path) return null;
   const originalUrl = `https://image.tmdb.org/t/p/w500${path}`;
@@ -39,60 +36,48 @@ function formatRuntime(minutes) {
   return `${h} ч ${m} мин`;
 }
 
-// Кэш для ID, чтобы не спамить запросами find
+// Кэш ID
 const idCache = {};
 
 async function getTmdbId(type, id) {
   if (id.startsWith("tmdb:")) return id.split(":")[1];
-
-  // Если это IMDb ID (tt12345)
   if (id.startsWith("tt")) {
-    if (idCache[id]) return idCache[id]; // Возврат из кэша
-
+    if (idCache[id]) return idCache[id];
     try {
+      if (!TMDB_KEY) throw new Error("TMDB_KEY is missing");
       const findUrl = `https://api.themoviedb.org/3/find/${id}?api_key=${TMDB_KEY}&external_source=imdb_id`;
       const { data } = await axios.get(findUrl);
       const result = type === "movie" ? data.movie_results[0] : data.tv_results[0];
-
       if (result) {
-        idCache[id] = result.id; // Запоминаем
+        idCache[id] = result.id;
         return result.id;
       }
-      return null;
     } catch (e) {
       console.error("ID Convert Error:", e.message);
-      return null;
     }
   }
-  return id;
+  return id; // Возвращаем как есть, если не нашли
 }
 
-// --- ОБРАБОТЧИК МЕТАДАННЫХ ---
-
+// --- ЛОГИКА АДДОНА ---
 builder.defineMetaHandler(async ({ type, id }) => {
-  // 1. Получаем TMDB ID
+  console.log(`Processing Meta: ${type} / ${id}`); // ЛОГ
+
   const tmdbId = await getTmdbId(type, id);
-  if (!tmdbId) {
-    // Если не нашли в TMDB, возвращаем пустой объект (Stremio покажет дефолтную Cinemeta)
-    return { meta: {} };
-  }
+  if (!tmdbId) return { meta: {} };
 
   const tmdbType = type === "movie" ? "movie" : "tv";
-
-  // Запрашиваем данные
   const url = `https://api.themoviedb.org/3/${tmdbType}/${tmdbId}?api_key=${TMDB_KEY}&language=${LANGUAGE}&append_to_response=videos,images,credits`;
 
   try {
     const { data } = await axios.get(url);
 
-    // Трейлеры
     const trailers = data.videos?.results
       .filter(v => v.site === "YouTube" && (v.type === "Trailer" || v.type === "Teaser"))
       .map(t => ({ source: t.key, type: "Trailer" })) || [];
 
-    // Формируем ответ
     const meta = {
-      id: id, // Возвращаем тот же ID (tt...), чтобы заменить Cinemeta
+      id: id,
       type: type,
       name: data.title || data.name,
       poster: proxyImage(data.poster_path),
@@ -110,69 +95,83 @@ builder.defineMetaHandler(async ({ type, id }) => {
         defaultVideoId: trailers.length > 0 ? trailers[0].source : null
       }
     };
-
     return { meta };
   } catch (e) {
-    console.error(`Meta Error for ${id}:`, e.message);
+    console.error(`TMDB Request Error: ${e.message}`);
     return { meta: {} };
   }
 });
 
-// --- ИСПРАВЛЕННЫЙ РОУТЕР ДЛЯ VERCEL ---
+// --- ROUTER VERCEL (FIXED) ---
 const addonInterface = builder.getInterface();
 
 module.exports = async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Content-Type', 'application/json');
+  try {
+    // Логируем входящий запрос для отладки
+    console.log(`Request: ${req.method} ${req.url}`);
 
-  // Очищаем URL от параметров (?foo=bar)
-  const cleanUrl = req.url.split('?')[0];
+    // CORS заголовки (обязательно)
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    res.setHeader('Content-Type', 'application/json');
 
-  // Главная страница
-  if (cleanUrl === '/' || cleanUrl === '/configure') {
-    res.statusCode = 302;
-    res.setHeader('Location', '/manifest.json');
-    res.end();
-    return;
-  }
+    if (req.method === 'OPTIONS') {
+      res.statusCode = 200;
+      res.end();
+      return;
+    }
 
-  // Манифест
-  if (cleanUrl === '/manifest.json') {
-    res.end(JSON.stringify(addonInterface.manifest));
-    return;
-  }
+    // Чистим URL
+    const cleanUrl = req.url.split('?')[0];
 
-  // Парсинг ресурса: /meta/movie/tt12345.json
-  // Используем split вместо regex для надежности
-  const parts = cleanUrl.split('/');
-  // parts[0] = "", parts[1] = resource, parts[2] = type, parts[3] = id.json
+    // Главная
+    if (cleanUrl === '/' || cleanUrl === '/configure') {
+      res.statusCode = 302;
+      res.setHeader('Location', '/manifest.json');
+      res.end();
+      return;
+    }
 
-  if (parts.length >= 4) {
-    const resource = parts[1];
-    const type = parts[2];
-    const idWithJson = parts[3];
-    const id = idWithJson.replace('.json', ''); // Убираем .json
+    // Манифест
+    if (cleanUrl === '/manifest.json') {
+      res.end(JSON.stringify(addonInterface.manifest));
+      return;
+    }
 
-    if (addonInterface[resource]) {
-      try {
-        // Вызываем обработчик
+    // Ловим запросы вида /meta/type/id.json
+    // Используем Regex, он надежнее для Vercel путей
+    const match = cleanUrl.match(/\/([^/]+)\/([^/]+)\/([^/]+)\.json/);
+
+    if (match) {
+      const resource = match[1]; // meta
+      const type = match[2];     // movie
+      const id = match[3];       // tt12345
+
+      if (addonInterface[resource]) {
         const result = await addonInterface[resource]({ type, id, extra: {} });
 
-        // Кешируем (важно для скорости)
-        res.setHeader('Cache-Control', 'max-age=86400, public'); // 1 день
+        // Кеш на 4 часа
+        res.setHeader('Cache-Control', 'max-age=14400, public');
         res.end(JSON.stringify(result));
-      } catch (e) {
-        console.error("Handler crashed:", e);
-        res.statusCode = 500;
-        res.end(JSON.stringify({ err: 'Handler failed' }));
+      } else {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ err: 'Resource not supported' }));
       }
     } else {
+      // Если путь не распознан
+      console.log(`Unknown path: ${cleanUrl}`);
       res.statusCode = 404;
-      res.end(JSON.stringify({ err: 'Resource not found' }));
+      res.end(JSON.stringify({ err: 'Not found', path: cleanUrl }));
     }
-  } else {
-    res.statusCode = 404;
-    res.end(JSON.stringify({ err: 'Invalid URL structure' }));
+
+  } catch (error) {
+    // Глобальный перехват ошибок
+    console.error("CRITICAL ERROR:", error);
+    res.statusCode = 500;
+    res.end(JSON.stringify({
+      err: 'Server Error',
+      details: error.message,
+      stack: error.stack
+    }));
   }
 };
