@@ -5,14 +5,17 @@ const TMDB_KEY = process.env.TMDB_KEY;
 const LANGUAGE = "ru-RU";
 
 const builder = new addonBuilder({
-  id: "org.tmdbproxy.translator",
-  version: "1.0.7",
+  id: "org.tmdbproxy.translator.fix",
+  version: "1.0.8",
   name: "TMDB Translator (RU)",
-  description: "Перевод описания и постеров на русский язык.",
-  resources: ["meta"],
+  description: "Попытка перевода Cinemeta. Включает тестовый каталог.",
+  resources: ["catalog", "meta"],
   types: ["movie", "series"],
   idPrefixes: ["tt", "tmdb"],
-  catalogs: [] // <--- ВОТ ЭТА СТРОЧКА ОБЯЗАТЕЛЬНА, даже если пустая
+  // Оставляем один каталог для проверки работоспособности!
+  catalogs: [
+    { type: "movie", id: "tmdb.test", name: "TMDB TEST (RU)" }
+  ]
 });
 
 // --- ХЕЛПЕРЫ ---
@@ -37,7 +40,6 @@ function formatRuntime(minutes) {
   return `${h} ч ${m} мин`;
 }
 
-// Кэш ID
 const idCache = {};
 
 async function getTmdbId(type, id) {
@@ -45,7 +47,7 @@ async function getTmdbId(type, id) {
   if (id.startsWith("tt")) {
     if (idCache[id]) return idCache[id];
     try {
-      if (!TMDB_KEY) throw new Error("TMDB_KEY is missing");
+      if (!TMDB_KEY) throw new Error("No API Key");
       const findUrl = `https://api.themoviedb.org/3/find/${id}?api_key=${TMDB_KEY}&external_source=imdb_id`;
       const { data } = await axios.get(findUrl);
       const result = type === "movie" ? data.movie_results[0] : data.tv_results[0];
@@ -60,10 +62,29 @@ async function getTmdbId(type, id) {
   return id;
 }
 
-// --- ЛОГИКА АДДОНА ---
-builder.defineMetaHandler(async ({ type, id }) => {
-  // console.log(`Processing Meta: ${type} / ${id}`); 
+// --- КАТАЛОГ (Для теста) ---
+builder.defineCatalogHandler(async ({ type, id }) => {
+  // Просто возвращаем популярные, чтобы убедиться, что русский язык работает
+  const url = `https://api.themoviedb.org/3/trending/movie/week?api_key=${TMDB_KEY}&language=${LANGUAGE}`;
+  try {
+    const { data } = await axios.get(url);
+    const metas = data.results.map(item => ({
+      id: `tmdb:${item.id}`, // Используем tmdb ID чтобы точно видеть наши данные
+      type: "movie",
+      name: item.title,
+      poster: proxyImage(item.poster_path),
+      description: item.overview
+    }));
+    return { metas };
+  } catch (e) {
+    console.error("Catalog Error:", e.message);
+    return { metas: [] };
+  }
+});
 
+// --- МЕТАДАННЫЕ ---
+builder.defineMetaHandler(async ({ type, id }) => {
+  console.log(`Getting meta for: ${id}`);
   const tmdbId = await getTmdbId(type, id);
   if (!tmdbId) return { meta: {} };
 
@@ -84,13 +105,12 @@ builder.defineMetaHandler(async ({ type, id }) => {
       poster: proxyImage(data.poster_path),
       background: proxyBackground(data.backdrop_path),
       logo: data.images?.logos?.length > 0 ? proxyImage(data.images.logos[0].file_path) : null,
-      description: data.overview || "Описание на русском отсутствует.",
+      description: data.overview || "Нет описания.",
       releaseInfo: (data.release_date || data.first_air_date || "").substring(0, 4),
       runtime: formatRuntime(data.runtime || (data.episode_run_time ? data.episode_run_time[0] : null)),
       genres: data.genres ? data.genres.map(g => g.name) : [],
       imdbRating: data.vote_average ? data.vote_average.toFixed(1) : null,
       cast: data.credits?.cast?.slice(0, 8).map(c => c.name),
-      director: data.credits?.crew?.filter(c => c.job === "Director").map(c => c.name),
       trailers: trailers,
       behaviorHints: {
         defaultVideoId: trailers.length > 0 ? trailers[0].source : null
@@ -98,66 +118,71 @@ builder.defineMetaHandler(async ({ type, id }) => {
     };
     return { meta };
   } catch (e) {
-    console.error(`TMDB Request Error: ${e.message}`);
+    console.error(`Meta Request Error: ${e.message}`);
     return { meta: {} };
   }
 });
 
-// --- ROUTER VERCEL ---
+// --- ROUTER (РУЧНОЙ ПАРСИНГ) ---
 const addonInterface = builder.getInterface();
 
 module.exports = async (req, res) => {
-  try {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', '*');
-    res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Content-Type', 'application/json');
 
-    if (req.method === 'OPTIONS') {
-      res.statusCode = 200;
-      res.end();
-      return;
-    }
+  if (req.method === 'OPTIONS') {
+    res.statusCode = 200;
+    res.end();
+    return;
+  }
 
-    const cleanUrl = req.url.split('?')[0];
+  // Убираем всё лишнее из URL
+  let path = req.url.split('?')[0];
+  // Убираем начальный слэш, если есть
+  if (path.startsWith('/')) path = path.substring(1);
 
-    if (cleanUrl === '/' || cleanUrl === '/configure') {
-      res.statusCode = 302;
-      res.setHeader('Location', '/manifest.json');
-      res.end();
-      return;
-    }
+  // Разбиваем на части
+  const parts = path.split('/');
 
-    if (cleanUrl === '/manifest.json') {
-      res.end(JSON.stringify(addonInterface.manifest));
-      return;
-    }
+  // Главная страница (путь пустой или index.js)
+  if (path === '' || path === 'index.js' || path === 'configure') {
+    res.statusCode = 302;
+    res.setHeader('Location', '/manifest.json');
+    res.end();
+    return;
+  }
 
-    const match = cleanUrl.match(/\/([^/]+)\/([^/]+)\/([^/]+)\.json/);
+  // Манифест
+  if (path === 'manifest.json') {
+    res.end(JSON.stringify(addonInterface.manifest));
+    return;
+  }
 
-    if (match) {
-      const resource = match[1];
-      const type = match[2];
-      const id = match[3];
+  // Обработка ресурсов: resource/type/id.json
+  // Пример: meta/movie/tt123.json
+  if (parts.length >= 3) {
+    const resource = parts[0];
+    const type = parts[1];
+    const id = parts[2].replace('.json', '');
 
-      if (addonInterface[resource]) {
+    if (addonInterface[resource]) {
+      try {
         const result = await addonInterface[resource]({ type, id, extra: {} });
-        res.setHeader('Cache-Control', 'max-age=14400, public');
+        // Ставим кеш поменьше для тестов (1 час)
+        res.setHeader('Cache-Control', 'max-age=3600, public');
         res.end(JSON.stringify(result));
-      } else {
-        res.statusCode = 404;
-        res.end(JSON.stringify({ err: 'Resource not supported' }));
+      } catch (e) {
+        console.error("Handler Failed:", e);
+        res.statusCode = 500;
+        res.end(JSON.stringify({ err: 'Handler Error' }));
       }
     } else {
       res.statusCode = 404;
-      res.end(JSON.stringify({ err: 'Not found', path: cleanUrl }));
+      res.end(JSON.stringify({ err: `Resource ${resource} not found` }));
     }
-
-  } catch (error) {
-    console.error("CRITICAL ERROR:", error);
-    res.statusCode = 500;
-    res.end(JSON.stringify({
-      err: 'Server Error',
-      details: error.message
-    }));
+  } else {
+    res.statusCode = 404;
+    res.end(JSON.stringify({ err: 'Invalid Path', path: path }));
   }
 };
